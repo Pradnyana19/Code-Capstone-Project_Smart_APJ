@@ -1,84 +1,95 @@
 /*
- * PROYEK: Smart PJU Berbasis FreeRTOS (Multi-Core ESP32) - MODE KENDALI MANUAL
- * KONEKSI PIN:
- * - Relay IN       : Pin 13
- * - Dimmer PWM/PSM : Pin 14
- * - Dimmer ZC      : Pin 32
- * - LDR 1          : Pin 15 (Monitoring Status)
- * - LDR 2          : Pin 35 (Monitoring Status)
- * - PZEM RX        : Pin D2 (Terhubung ke ESP32 TX2 / GPIO 2)
- * - PZEM TX        : Pin D4 (Terhubung ke ESP32 RX2 / GPIO 4)
- * - GPS RX         : Pin 25 (Terhubung ke ESP32 TX1)
- * - GPS TX         : Pin 26 (Terhubung ke ESP32 RX1)
- * - LCD SDA        : Pin 21 
- * - LCD SCL        : Pin 22 
+ * PROGRAM UTAMA: Smart PJU Berbasis FreeRTOS (Dual-Core ESP32)
+ * DESKRIPSI: Otomatisasi berbasis Waktu (NTP + GPS), Monitoring PZEM-004T, Dual-LDR, 
+ * LCD, Proteksi Mutex, IoT ThingSpeak (Field 4 Only), dan Google Spreadsheet Backup.
+ * JADWAL DOKUMENTASI: 21:15-21:25 (Dim 97%), 21:25-06:00 (Dim 60%), Sisanya MATI.
+ * FITUR TAMBAHAN: Rekoneksi Wi-Fi otomatis secara berkala (Non-blocking Timer).
  */
 
+#include <WiFi.h>
+#include <HTTPClient.h> 
 #include <PZEM004Tv30.h>
-#include <Wire.h>              
+#include <Wire.h>          
 #include <LiquidCrystal_I2C.h> 
 #include <RBDdimmer.h>
 #include <TinyGPSPlus.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
 #include <time.h>
 
-// ================= KONFIGURASI WIFI & THINGSPEAK =================
-const char* ssid       = "NAMA_WIFI_ANDA";
-const char* password   = "PASSWORD_WIFI";
-String apiKey          = "Q5NO77H68QGKDZ7S"; // Pastikan ini Write API Key Anda
-const char* serverName = "http://api.thingspeak.com/update";
+// --- KONFIGURASI WIFI & CLOUD CLUSTER ---
+const char* ssid       = "Ssa_--";             
+const char* password   = "IGSKD2DD";             
 
-// ================= KONFIGURASI WAKTU (NTP) =================
-const char* ntpServer  = "pool.ntp.org";
-const long  gmtOffset_sec = 28800; // GMT+8 (WITA)
+// Konfigurasi ThingSpeak
+String apiKey          = "Q5NO77H68QGKDZ7S"; 
+const char* serverName = "http://api.thingspeak.com/update"; 
+
+// Konfigurasi Google Spreadsheet 
+const String googleScriptDeploymentId = "AKfycbx8ccrFqPJp9Yw0WG76xKzYjpkwH4WDFcoCy_ayM16Qzz9WMjqzdE8MtV_556_GZaL2";
+
+// Konfigurasi NTP Server Waktu
+const char* ntpServer          = "pool.ntp.org";
+const long  gmtOffset_sec      = 28800;  // WITA (UTC+8)
 const int   daylightOffset_sec = 0;
 
 // ================= DEKLARASI PIN HARDWARE =================
-#define RELAY_PIN 13
-#define DIMMER_PIN 14
-#define ZC_PIN 32
+#define RELAY_PIN       13
+#define DIMMER_PIN      14
+#define ZC_PIN          36  
 
-#define LDR1_PIN 15 
-#define LDR2_PIN 35 
+#define LDR1_PIN        34  
+#define LDR2_PIN        35  
 
-#define ESP32_RX2_PZEM 4  // D4 
-#define ESP32_TX2_PZEM 2  // D2 
+#define ESP32_RX2_PZEM  2
+#define ESP32_TX2_PZEM  4 
 
-#define ESP32_RX1_GPS 26 
-#define ESP32_TX1_GPS 25 
+#define ESP32_RX1_GPS   33
+#define ESP32_TX1_GPS   25
 
-#define LCD_SDA_PIN 21 
-#define LCD_SCL_PIN 22
+#define LCD_SDA_PIN     21 
+#define LCD_SCL_PIN     22
 
 // Inisialisasi Objek Hardware
-PZEM004Tv30 pzem(Serial2, ESP32_RX2_PZEM, ESP32_TX2_PZEM); 
-HardwareSerial SerialGPS(1); 
+PZEM004Tv30 pzem(Serial2, ESP32_RX2_PZEM, ESP32_TX2_PZEM);
+HardwareSerial SerialGPS(1);
 TinyGPSPlus gps;
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 dimmerLamp acDimmer(DIMMER_PIN, ZC_PIN);
 
-// Variabel Global (Gunakan volatile karena diakses antar Core/Task)
-volatile int kecerahanTarget = 0; 
-volatile int statusLampu = 0; // 0: Siang/Mati, 1: Normal, 2: Rusak
-volatile int jamSekarang = 12;
+// Shared Resources & FreeRTOS Sync
+SemaphoreHandle_t xSistemMutex; 
+int kecerahanTarget = 0;           
+int jamSekarang = 12; // Default siang jika belum sinkron
+int menitSekarang = 0; 
 
+// Penahan Waktu Transmisi Data Cloud (Non-blocking)
 unsigned long lastTimeThingSpeak = 0;
-unsigned long delayThingSpeak = 20000; 
+unsigned long delayThingSpeak = 30000;    // ThingSpeak per 30 detik
 
-// Deklarasi Task Handle FreeRTOS
-TaskHandle_t TaskSensorWiFi;
-TaskHandle_t TaskKendaliDimmer;
+unsigned long lastTimeSpreadsheet = 0;
+unsigned long delaySpreadsheet = 10000;   // Google Spreadsheet per 10 detik
+
+// Penahan Waktu Rekoneksi Wi-Fi (Non-blocking)
+unsigned long lastTimeReconnectWiFi = 0;
+unsigned long delayReconnectWiFi = 10000;  // Coba menyambung kembali setiap 10 detik jika putus
+
+// Deklarasi Task Handle
+TaskHandle_t TaskSensorDisplay = NULL;
+TaskHandle_t TaskKendaliDimmer = NULL;
 
 // =======================================================
-// TASK 1: BACA SENSOR, LCD & KIRIM THINGSPEAK (Di Core 0)
+// TASK 1: MONITORING SENSOR, TIME SYNC, DISPLAY, & IOT (Core 0)
 // =======================================================
 void fungsiTaskSensor(void *pvParameters) {
+  int localKecerahan = 0;
+  int localJam = 12;
+  int localMenit = 0;
+  
   for(;;) {
-    // 1. Sinkronisasi Waktu dari NTP (Masih dipertahankan untuk referensi data)
+    // 1. SINKRONISASI WAKTU (NTP Terlebih Dahulu, Backup ke GPS)
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 10)) { 
-      jamSekarang = timeinfo.tm_hour;
+      localJam = timeinfo.tm_hour;
+      localMenit = timeinfo.tm_min;
     } 
     else {
       while (SerialGPS.available() > 0) {
@@ -87,11 +98,20 @@ void fungsiTaskSensor(void *pvParameters) {
       if (gps.time.isValid()) {
         int gpsJam = gps.time.hour() + 8; // Konversi ke WITA
         if (gpsJam >= 24) gpsJam -= 24;
-        jamSekarang = gpsJam;
+        localJam = gpsJam;
+        localMenit = gps.time.minute();
       }
     }
 
-    // 2. Baca Data Elektrik PZEM
+    // Simpan data jam dan menit terbaru ke variabel global secara aman
+    if (xSemaphoreTake(xSistemMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      jamSekarang = localJam;
+      menitSekarang = localMenit;
+      localKecerahan = kecerahanTarget; 
+      xSemaphoreGive(xSistemMutex);
+    }
+
+    // 2. Pembacaan Sensor Listrik PZEM
     float tegangan = pzem.voltage();
     float arus     = pzem.current();
     float daya     = pzem.power();
@@ -100,166 +120,262 @@ void fungsiTaskSensor(void *pvParameters) {
     if (isnan(arus))     { arus = 0.0; }
     if (isnan(daya))     { daya = 0.0; }
 
-    // Baca 2 Buah Sensor LDR untuk Monitoring
-    int nilaiLDR1 = analogRead(LDR1_PIN);
-    int nilaiLDR2 = analogRead(LDR2_PIN);
+    // 3. Pembacaan Dua Sensor LDR
+    int ldrVal1 = analogRead(LDR1_PIN);
+    int ldrVal2 = analogRead(LDR2_PIN);
 
-    // 3. Logika Validasi Gangguan Ganda
-    if (kecerahanTarget > 0) {
-      if (arus <= 0.02 || nilaiLDR1 > 3000 || nilaiLDR2 > 3000) {
-        statusLampu = 2; // RUSAK
+    // 4. Implementasi Logika Status Validasi Gangguan
+    int status1 = 0; 
+    String statusString = "0";
+    
+    if (localKecerahan > 0) {
+      if (arus <= 0.02 && (ldrVal1 > 3000 || ldrVal2 > 3000)) {
+        status1 = 2; // RUSAK
+        statusString = "2";
       } else {
-        statusLampu = 1; // NYALA NORMAL
+        status1 = 1; // NYALA NORMAL
+        statusString = "1";
       }
     } else {
-      statusLampu = 0; // STANDBY (Target 0%)
+      status1 = 0; // STANDBY SIANG
+      statusString = "0";
     }
 
-    // 4. Tampilan LCD Fokus Parameter Listrik
+    // 5. Update LCD - Menampilkan Arus, Tegangan, dan Daya saja
     lcd.setCursor(0, 0);
     lcd.print("V:"); lcd.print(tegangan, 1); lcd.print("V ");
     lcd.setCursor(9, 0);
     lcd.print("I:"); lcd.print(arus, 2); lcd.print("A");
 
     lcd.setCursor(0, 1);
-    lcd.print("D: "); lcd.print(daya, 1); lcd.print("W ");
-    lcd.setCursor(10, 1);
-    lcd.print("L:"); lcd.print(kecerahanTarget); lcd.print("%  "); // Menampilkan status Dimmer di LCD
+    lcd.print("Daya: "); lcd.print(daya, 1); lcd.print(" Watt   "); 
 
-    // 5. Pengiriman Data Berkala ke ThingSpeak
-    if ((millis() - lastTimeThingSpeak) > delayThingSpeak) {
-      if(WiFi.status() == WL_CONNECTED){
-        
-        String myLatitude = "0.000000";
-        String myLongitude = "0.000000";
-        if (gps.location.isValid()) {
-          myLatitude = String(gps.location.lat(), 6);
-          myLongitude = String(gps.location.lng(), 6);
-        }
+    // 6. Kirim Serial Data Telemetri untuk Monitoring Lokal
+    Serial.printf("[TELEMETRI] Jam: %02d:%02d | V: %.1fV | I: %.2fA | P: %.1fW\n", localJam, localMenit, tegangan, arus, daya);
+    Serial.printf("[ANALISIS LDR] LDR1: %d | LDR2: %d | Status Kode: %s\n", ldrVal1, ldrVal2, statusString.c_str());
 
-        HTTPClient http;
-        String urlPath = String(serverName) + "?api_key=" + apiKey + 
-                         "&field1=" + String(daya) +       
-                         "&field2=" + String(tegangan) +   
-                         "&field3=" + String(arus) +       
-                         "&field4=" + String(statusLampu)+ 
-                         "&field5=" + myLatitude +         
-                         "&field6=" + myLongitude;         
-        
-        http.begin(urlPath);
-        int httpResponseCode = http.GET();
-        if(httpResponseCode > 0){
-           Serial.print("[ThingSpeak] Terkirim. Kode: ");
-           Serial.println(httpResponseCode);
-        } else {
-           Serial.print("[ThingSpeak] Gagal. Kode: ");
-           Serial.println(httpResponseCode);
-        }
-        http.end(); 
+    // 7. PENGIRIMAN DATA KE CLOUD & MANAGEMENT REKONEKSI WIFI
+    if (WiFi.status() == WL_CONNECTED) {
+      
+      String myLatitude = "0.000000";
+      String myLongitude = "0.000000";
+      if (gps.location.isValid()) {
+        myLatitude = String(gps.location.lat(), 6);
+        myLongitude = String(gps.location.lng(), 6);
       }
-      lastTimeThingSpeak = millis();
+
+      // --- TRANSMISI 1: THINGSPEAK (Setiap 30 Detik) ---
+      if ((millis() - lastTimeThingSpeak) > delayThingSpeak) {
+        HTTPClient httpTS;
+        String urlPath = String(serverName) + "?api_key=" + apiKey + 
+                         "&field1=" + String(daya) +      
+                         "&field2=" + String(tegangan) +  
+                         "&field3=" + String(arus) +      
+                         "&field4=" + String(status1) +    
+                         "&field5=" + myLatitude +        
+                         "&field6=" + myLongitude;        
+        
+        httpTS.begin(urlPath);
+        int httpResponseCodeTS = httpTS.GET();
+        if (httpResponseCodeTS > 0) {
+           Serial.printf("[ThingSpeak] Terkirim. Respon: %d\n", httpResponseCodeTS);
+        } else {
+           Serial.printf("[ThingSpeak] Gagal. Error: %s\n", httpTS.errorToString(httpResponseCodeTS).c_str());
+        }
+        httpTS.end();
+        lastTimeThingSpeak = millis();
+      }
+
+      // --- TRANSMISI 2: GOOGLE SPREADSHEET (Setiap 10 Detik) ---
+      if ((millis() - lastTimeSpreadsheet) > delaySpreadsheet) {
+        HTTPClient httpSheets;
+        
+        String urlSheets = "https://script.google.com/macros/s/" + googleScriptDeploymentId + "/exec" +
+                           "?daya=" + String(daya) +
+                           "&tegangan=" + String(tegangan) +
+                           "&arus=" + String(arus) +
+                           "&status=" + status1;
+        
+        httpSheets.begin(urlSheets);
+        httpSheets.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        
+        int httpResponseCodeSheets = httpSheets.GET();
+        if (httpResponseCodeSheets > 0) {
+           Serial.printf("[Spreadsheet] Berhasil Terkirim. Respon Server: %d\n", httpResponseCodeSheets);
+        } else {
+           Serial.printf("[Spreadsheet] Gagal Mengirim. Error: %s\n", httpSheets.errorToString(httpResponseCodeSheets).c_str());
+        }
+        httpSheets.end();
+        lastTimeSpreadsheet = millis();
+      }
+
+    } else {
+      // PERBAIKAN REKONEKSI WIFI (NON-BLOCKING):
+      // Jika koneksi putus, coba hubungkan kembali setiap interval 10 detik tanpa menggunakan fungsi delay() pembatas.
+      if ((millis() - lastTimeReconnectWiFi) > delayReconnectWiFi) {
+        Serial.println(F("[SISTEM] Wi-Fi terputus! Mencoba menghubungkan kembali..."));
+        WiFi.disconnect();
+        WiFi.begin(ssid, password);
+        lastTimeReconnectWiFi = millis();
+      }
     }
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
 // =======================================================
-// TASK 2: KENDALI DIMMER MANUAL DARI SERIAL (Di Core 1)
+// TASK 2: KENDALI OTOMATIS BERBASIS WAKTU & SERIAL OVERRIDE (Core 1)
 // =======================================================
 void fungsiTaskKendali(void *pvParameters) {
-  int kecerahanSaatIni = -1; // Pelacak status hardware agar tidak dieksekusi berulang-ulang
-
+  String inputBuffer = "";
+  bool modeManual = false;
+  int localJam = 12;
+  int localMenit = 0;
+  
   for(;;) {
-    // 1. Baca Input dari Serial Monitor (0 - 100)
-    if (Serial.available() > 0) {
-      int inputUser = Serial.parseInt();
-
-      // Bersihkan sisa karakter enter (newline) di buffer
-      while (Serial.available() > 0) {
-        Serial.read();
-      }
-
-      if (inputUser >= 0 && inputUser <= 100) {
-        kecerahanTarget = inputUser;
-        Serial.print(">> PERINTAH DITERIMA: Target Dimmer = ");
-        Serial.print(kecerahanTarget);
-        Serial.println("%");
+    // 1. Cek Perintah Manual Dari Serial Monitor (Override)
+    while (Serial.available() > 0) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        if (inputBuffer.length() > 0) {
+          if (inputBuffer == "auto") {
+            modeManual = false;
+            Serial.println(F("\n[SISTEM] -> KEMBALI KE MODE OTOMATISASI JADWAL JAM"));
+          } else {
+            int inputUser = inputBuffer.toInt();
+            if (inputUser >= 0 && inputUser <= 100) {
+              modeManual = true;
+              if (xSemaphoreTake(xSistemMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                kecerahanTarget = inputUser;
+                xSemaphoreGive(xSistemMutex);
+              }
+              
+              if (inputUser == 0) {
+                digitalWrite(RELAY_PIN, LOW);  
+                acDimmer.setPower(0);          
+                acDimmer.setState(OFF);        
+                Serial.println(F("\n[MANUAL] -> RELAY OFF, DIMMER 0%"));
+              } else {
+                digitalWrite(RELAY_PIN, HIGH); 
+                acDimmer.setState(ON);         
+                acDimmer.setPower(inputUser);
+                Serial.printf("[MANUAL] -> KENDALI PAKSA %d%% (Ketik 'auto' untuk mengembalikan)\n", inputUser);
+              }
+            }
+          }
+          inputBuffer = ""; 
+        }
+      } else if (isDigit(c) || c == 'a' || c == 'u' || c == 't' || c == 'o') {
+        inputBuffer += c; 
       }
     }
 
-    // 2. Eksekusi Perubahan Hardware HANYA JIKA target berubah
-    if (kecerahanTarget != kecerahanSaatIni) {
-      if (kecerahanTarget == 0) {
-        digitalWrite(RELAY_PIN, LOW); // Putus Relay
-        acDimmer.setPower(0);
-        acDimmer.setState(OFF);       // Kunci TRIAC padam total
-      } 
-      else {
-        digitalWrite(RELAY_PIN, HIGH); // Nyalakan Relay
-        acDimmer.setState(ON);
+    // 2. JIKA MODE OTOMATIS (Penjadwalan Khusus Dokumentasi)
+    if (!modeManual) {
+      if (xSemaphoreTake(xSistemMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        localJam = jamSekarang;
+        localMenit = menitSekarang;
+        xSemaphoreGive(xSistemMutex);
+      }
 
-        // Trik Anti-Flicker untuk kecerahan 100%
-        if (kecerahanTarget == 100) {
-          acDimmer.setPower(95); 
-        } else {
-          acDimmer.setPower(kecerahanTarget);
+      int totalMenit = (localJam * 60) + localMenit;
+      
+      int batasMulaiTerang = (18 * 60) + 0; // 21:15 -> 1275 menit
+      int batasMulaiRedup  = (23 * 60) + 59; // 21:25 -> 1285 menit
+      int batasSelesaiMalam = (6 * 60);      // 06:00 -> 360 menit
+
+      // Kondisi A: Jam 21:15 sampai 21:24
+      if (totalMenit >= batasMulaiTerang && totalMenit < batasMulaiRedup) {
+        digitalWrite(RELAY_PIN, HIGH); 
+        acDimmer.setState(ON);
+        acDimmer.setPower(97); 
+
+        if (xSemaphoreTake(xSistemMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          kecerahanTarget = 100; 
+          xSemaphoreGive(xSistemMutex);
+        }
+      } 
+      // Kondisi B: Jam 21:25 sampai 05:59 Pagi
+      else if (totalMenit >= batasMulaiRedup || totalMenit < batasSelesaiMalam) {
+        digitalWrite(RELAY_PIN, HIGH); 
+        acDimmer.setState(ON);
+        acDimmer.setPower(60); 
+
+        if (xSemaphoreTake(xSistemMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          kecerahanTarget = 60; 
+          xSemaphoreGive(xSistemMutex);
+        }
+      } 
+      // Kondisi C: Sisa Waktu Lainnya (06:00 pagi sampai 21:14 malam) -> MATI TOTAL
+      else {
+        digitalWrite(RELAY_PIN, LOW); 
+        acDimmer.setPower(0);
+        acDimmer.setState(OFF);
+
+        if (xSemaphoreTake(xSistemMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          kecerahanTarget = 0;
+          xSemaphoreGive(xSistemMutex);
         }
       }
-      // Simpan status agar hardware tidak terus-menerus diset ulang di siklus berikutnya
-      kecerahanSaatIni = kecerahanTarget; 
     }
 
-    // Jeda super singkat 20ms untuk stabilitas hardware
-    vTaskDelay(20 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
+// =======================================================
+// SETUP & INITIALIZATION
+// =======================================================
 void setup() {
   Serial.begin(115200);
   SerialGPS.begin(9600, SERIAL_8N1, ESP32_RX1_GPS, ESP32_TX1_GPS);
-  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN); 
+  while(!Serial) { ; } 
   
+  xSistemMutex = xSemaphoreCreateMutex();
+  
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0,0);
-  lcd.print("  SMART PJU IoT ");
-  lcd.setCursor(0,1);
-  lcd.print(" Connect WiFi.. ");
-
-  // Mencoba tersambung ke jaringan WiFi
+  
+  lcd.setCursor(0, 0); lcd.print("  SMART PJU IoT ");
+  lcd.setCursor(0, 1); lcd.print("CONNECTING WIFI ");
+  
+  acDimmer.begin(NORMAL_MODE, ON);
+  acDimmer.setPower(0);
+  acDimmer.setState(OFF);
+  
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
+  int timeout_counter = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout_counter < 20) {
     delay(500);
     Serial.print(".");
+    timeout_counter++;
   }
-  Serial.println("\nWiFi Terhubung!");
-  Serial.println("Ketik angka 0 - 100 di Serial Monitor untuk mengatur dimmer.");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("\n>> Wi-Fi Terhubung Sukses!"));
+    lcd.setCursor(0, 1); lcd.print("WIFI CONNECTED  ");
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  } else {
+    Serial.println(F("\n>> Wi-Fi Offline (Mengandalkan Waktu GPS)"));
+    lcd.setCursor(0, 1); lcd.print("WIFI OFFLINE    ");
+  }
   
-  // Sinkronisasi awal waktu NTP
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  delay(1500); 
   lcd.clear();
-
-  // Konfigurasi Pin Relay & Dimmer
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW); // Default Mati
   
-  acDimmer.begin(NORMAL_MODE, ON); 
-  acDimmer.setPower(0);
-  acDimmer.setState(OFF); // Default Mati
-  
-  // -----------------------------------------------------
-  // DEPLOYMENT TASK KE CORE MASING-MASING
-  // -----------------------------------------------------
-  xTaskCreatePinnedToCore(
-    fungsiTaskSensor, "TaskSensorWiFi", 15000, NULL, 1, &TaskSensorWiFi, 0                      
-  );
+  Serial.println(F("\n============================================="));
+  Serial.println(F("   SISTEM KENDALI UTAMA BERHASIL DIALIRKAN   "));
+  Serial.println(F("============================================="));
 
-  xTaskCreatePinnedToCore(
-    fungsiTaskKendali, "TaskKendaliDimmer", 10000, NULL, 2, &TaskKendaliDimmer, 1                      
-  );
+  xTaskCreatePinnedToCore(fungsiTaskSensor, "TaskSensorDisplay", 8192, NULL, 1, &TaskSensorDisplay, 0);
+  xTaskCreatePinnedToCore(fungsiTaskKendali, "TaskKendaliDimmer", 4096, NULL, 2, &TaskKendaliDimmer, 1);
 }
 
 void loop() {
-  // Loop dibiarkan kosong, FreeRTOS mengambil alih
+  vTaskDelete(NULL); 
 }
